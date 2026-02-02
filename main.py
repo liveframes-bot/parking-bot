@@ -1,14 +1,16 @@
 import re
 import os
 import json
+import asyncio
 
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
 
 import gspread
+from aiohttp import web
 
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1Zq1GarjOPmftln_g45djjz0bvUKTZQubgDBmfbTH26A/edit?usp=sharing"
 SHEET_NAME = "Ответы на форму (1)"  # имя листа
@@ -113,37 +115,47 @@ dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.reply(
-        "Здравствуйте!\n\n"
-        "Пожалуйста, введите полностью госномер автомобиля "
-        "(например: A777AA777)."
+    await bot.send_message(
+        chat_id=message.chat.id,
+        text=(
+            "Здравствуйте!\n\n"
+            "Пожалуйста, введите полностью госномер автомобиля "
+            "(например: A777AA777)."
+        ),
     )
 
 
 @dp.message(Command("reload"))
 async def cmd_reload(message: Message):
-    await message.reply("Обновляю данные из таблицы...")
+    await bot.send_message(chat_id=message.chat.id, text="Обновляю данные из таблицы...")
     try:
         global plates
         new_plates = load_plates()
         plates.clear()
         plates.update(new_plates)
-        await message.reply(f"Готово. Загружено номеров: {len(plates)}")
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text=f"Готово. Загружено номеров: {len(plates)}",
+        )
     except Exception as e:
-        await message.reply(f"Ошибка при обновлении: {e}")
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text=f"Ошибка при обновлении: {e}",
+        )
 
 
-@dp.message()
+# Обрабатываем только сообщения с текстом, похожим на госномер
+@dp.message(F.text)
 async def handle_message(message: Message):
     text = (message.text or "").strip()
     norm = normalize_plate(text)
 
-    # если из текста после нормализации ничего не осталось — просим ввести номер
     if not norm:
-        await message.reply(
-            "Пожалуйста, введите полный госномер автомобиля "
-            "(например: A777AA777)."
-        )
+        return
+
+    # Формат: 1 буква + 3 цифры + 2 буквы + 2–3 цифры (A777AA777, M175HH750 и т.п.)
+    if not re.fullmatch(r"[A-Z]\d{3}[A-Z]{2}\d{2,3}", norm):
+        # Не похоже на номер — игнорируем
         return
 
     data = plates.get(norm)
@@ -158,14 +170,37 @@ async def handle_message(message: Message):
             "и в формате наподобие A777AA777."
         )
 
-    await message.reply(reply)
+    await bot.send_message(chat_id=message.chat.id, text=reply)
+
+
+# --- HTTP‑сервер для Render ---
+
+
+async def health(request):
+    return web.Response(text="OK")
+
+
+async def start_http_app():
+    app = web.Application()
+    app.add_routes([web.get("/health", health)])
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    # Render передаёт порт через переменную PORT, по умолчанию 10000
+    port = int(os.environ.get("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"HTTP server started on port {port}")
 
 
 async def main():
-    await dp.start_polling(bot)
+    # запускаем HTTP‑сервер и aiogram‑бота параллельно
+    await asyncio.gather(
+        start_http_app(),
+        dp.start_polling(bot),
+    )
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
