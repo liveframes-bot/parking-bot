@@ -1,5 +1,6 @@
 import re
 import os
+import json
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
@@ -8,12 +9,11 @@ from aiogram.types import Message
 import gspread
 
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1Zq1GarjOPmftln_g45djjz0bvUKTZQubgDBmfbTH26A/edit?usp=sharing"
-CREDENTIALS_FILE = "virtual-charger-404013-95cc392801ce.json"
 
 SHEET_NAME = "Ответы на форму (1)"  # имя листа
-COL_PLATE = 7   # G
-COL_NAME = 5    # E
-COL_PHONE = 11  # K
+COL_PLATE = 7   # G: "Гос. № автомобиля"
+COL_NAME = 5    # E: "Ф.И.О. (полностью)"
+COL_PHONE = 11  # K: телефон
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -35,7 +35,14 @@ def normalize_plate(text: str) -> str:
 
 
 def load_plates():
-    gc = gspread.service_account(filename=CREDENTIALS_FILE)
+    # читаем JSON ключ сервисного аккаунта из переменной окружения
+    service_account_info = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not service_account_info:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+
+    creds_dict = json.loads(service_account_info)
+    gc = gspread.service_account_from_dict(creds_dict)
+
     sh = gc.open_by_url(SPREADSHEET_URL)
     ws = sh.worksheet(SHEET_NAME)
 
@@ -62,12 +69,10 @@ def load_plates():
     return plates_index
 
 
-# глобальный словарь номеров
 plates = {}
 plates.update(load_plates())
 print("Всего номеров в индексе:", len(plates))
 print("Примеры:", list(plates.keys())[:20])
-
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
