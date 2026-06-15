@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: parking-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py  # замените на ваш файл
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.4
