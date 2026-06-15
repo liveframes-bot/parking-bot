@@ -250,31 +250,39 @@ def find_by_plate_partial(query: str):
     
     return unique_results
 
-
-def format_search_result(user: dict):
+def format_search_result(user: dict) -> str:
     """
     Форматирует один результат поиска для отображения
     """
-    phone = user['phone'] if user['phone'] else 'не указан'
-    phone_link = format_phone_link(user['phone']) if user['phone'] else None
-    
     masked = mask_fio(user['fio'])
     display_plate = get_display_plate(user['plate_raw'])
     
-    # Если есть телефон и ссылка, делаем кликабельным
-    if phone_link:
-        phone_display = f'<a href="{phone_link}">{phone}</a>'
+    # Обработка телефона
+    if user['phone'] and user['phone'].strip():
+        # Очищаем номер от лишних символов
+        digits = re.sub(r'\D', '', user['phone'])
+        
+        # Приводим к международному формату (с кодом 7)
+        if len(digits) == 11 and digits.startswith('8'):
+            digits = '7' + digits[1:]
+        elif len(digits) == 10:
+            digits = '7' + digits
+        
+        # Отображаем с плюсом: +79295331517
+        display_phone = '+' + digits
+        
+        # Делаем кликабельным: tel:+79295331517
+        phone_link = f'<a href="tel:{digits}">{display_phone}</a>'
     else:
-        phone_display = phone
+        phone_link = 'не указан'
     
     response = (
         f"🚗 <b>Гос. номер:</b> <code>{display_plate}</code>\n"
         f"👤 <b>Владелец:</b> {masked}\n"
-        f"📞 <b>Телефон:</b> {phone_display}\n"
+        f"📞 <b>Телефон:</b> {phone_link}\n"
         f"📂 <b>Категория:</b> {user['category']}\n"
     )
     return response
-
 
 # ======== КОМАНДЫ БОТА ========
 @dp.message(Command("start"))
