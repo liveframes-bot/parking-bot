@@ -3,6 +3,8 @@ import re
 import json
 import asyncio
 import logging
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -24,6 +26,36 @@ if not TELEGRAM_TOKEN or not SPREADSHEET_ID or not GOOGLE_CREDS_JSON:
 # ======== ЛОГИРОВАНИЕ ========
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ======== HEALTH-СЕРВЕР ДЛЯ RENDER ========
+class HealthHandler(BaseHTTPRequestHandler):
+    """Обработчик health-запросов для Render"""
+    
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Отключаем логи health-проверок
+        if '/health' not in args[0] if args else False:
+            super().log_message(format, *args)
+
+
+def run_health_server():
+    """Запуск health-сервера на порту 8080"""
+    server = HTTPServer(('0.0.0.0', 8080), HealthHandler)
+    logger.info("🏥 Health-сервер запущен на порту 8080")
+    server.serve_forever()
+
+
+# Запускаем health-сервер в отдельном потоке
+health_thread = Thread(target=run_health_server, daemon=True)
+health_thread.start()
 
 # ======== ИНИЦИАЛИЗАЦИЯ ========
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -114,6 +146,8 @@ def get_plate_numbers(plate_field: str) -> list:
     """
     Извлекает все номера из строки (разделители , ;)
     """
+    if not plate_field:
+        return []
     numbers = re.split(r'[,;]', plate_field)
     return [normalize_plate(n.strip()) for n in numbers if n.strip()]
 
@@ -131,6 +165,8 @@ def is_valid_phone(phone: str) -> bool:
 def format_phone_link(phone: str) -> str:
     """Форматирует телефон для кликабельной ссылки tel:"""
     digits = re.sub(r'\D', '', phone)
+    if not digits:
+        return ""
     if len(digits) == 11 and digits.startswith('8'):
         digits = '7' + digits[1:]
     elif len(digits) == 10:
@@ -216,23 +252,29 @@ def find_by_plate_partial(query: str):
     return unique_results
 
 
-def format_search_result(user: dict) -> str:
+def format_search_result(user: dict):
     """
     Форматирует один результат поиска для отображения
     """
     phone = user['phone'] if user['phone'] else 'не указан'
-    phone_link = format_phone_link(phone) if user['phone'] else None
+    phone_link = format_phone_link(user['phone']) if user['phone'] else None
     
     masked = mask_fio(user['fio'])
     display_plate = get_display_plate(user['plate_raw'])
     
+    # Если есть телефон и ссылка, делаем кликабельным
+    if phone_link:
+        phone_display = f'<a href="{phone_link}">{phone}</a>'
+    else:
+        phone_display = phone
+    
     response = (
         f"🚗 <b>Гос. номер:</b> <code>{display_plate}</code>\n"
         f"👤 <b>Владелец:</b> {masked}\n"
-        f"📞 <b>Телефон:</b> {phone}\n"
+        f"📞 <b>Телефон:</b> {phone_display}\n"
         f"📂 <b>Категория:</b> {user['category']}\n"
     )
-    return response, phone_link
+    return response
 
 
 # ======== КОМАНДЫ БОТА ========
@@ -375,7 +417,7 @@ async def send_search_results(message: Message, chat_id: int, page: int):
     response_parts = [f"🔍 <b>Найдено автомобилей: {len(results)}</b>\n"]
     
     for i, result in enumerate(page_results, start=start_idx + 1):
-        formatted, _ = format_search_result(result)
+        formatted = format_search_result(result)
         response_parts.append(f"{i}. {formatted}")
         response_parts.append("─" * 30)
     
