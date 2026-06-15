@@ -5,7 +5,7 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -13,10 +13,13 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ======== НАСТРОЙКИ ========
-TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
-SPREADSHEET_ID = os.environ['SPREADSHEET_ID']
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID')
 SHEET_NAME = os.environ.get('SHEET_NAME', 'Лист1')
-GOOGLE_CREDS_JSON = os.environ['GOOGLE_CREDS_JSON']
+GOOGLE_CREDS_JSON = os.environ.get('GOOGLE_CREDS_JSON')
+
+if not TELEGRAM_TOKEN or not SPREADSHEET_ID or not GOOGLE_CREDS_JSON:
+    raise ValueError("Отсутствуют обязательные переменные окружения!")
 
 # ======== ЛОГИРОВАНИЕ ========
 logging.basicConfig(level=logging.INFO)
@@ -27,15 +30,32 @@ bot = Bot(token=TELEGRAM_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Подключение к Google Sheets
+# ======== КОНСТАНТЫ ========
+RESULTS_PER_PAGE = 5  # Количество результатов на одной странице
+
+# Карта замены русских букв на английские в номере
+RUS_TO_ENG = {
+    'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M',
+    'Н': 'H', 'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T',
+    'У': 'Y', 'Х': 'X'
+}
+ENG_TO_RUS = {v: k for k, v in RUS_TO_ENG.items()}
+
+# ======== ПОДКЛЮЧЕНИЕ GOOGLE SHEETS ========
 def init_gsheets():
-    creds_dict = json.loads(GOOGLE_CREDS_JSON)
-    scope = ['https://spreadsheets.google.com/feeds',
-             'https://www.googleapis.com/auth/drive']
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
-    return sheet
+    """Инициализация подключения к Google Sheets"""
+    try:
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+        scope = ['https://spreadsheets.google.com/feeds',
+                 'https://www.googleapis.com/auth/drive']
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+        logger.info("✅ Подключение к Google Sheets успешно")
+        return sheet
+    except Exception as e:
+        logger.error(f"❌ Ошибка подключения к Google Sheets: {e}")
+        raise
 
 sheet = init_gsheets()
 
@@ -44,6 +64,7 @@ sheet = init_gsheets()
 class UserState(StatesGroup):
     waiting_for_phone = State()
     waiting_for_plate = State()
+    searching_plate = State()
 
 
 # ======== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========
@@ -63,10 +84,42 @@ def mask_fio(fio: str) -> str:
 
 
 def normalize_plate(plate: str) -> str:
-    return re.sub(r'\s+', '', plate).upper()
+    """
+    Нормализует номер:
+    - Удаляет пробелы
+    - Приводит к верхнему регистру
+    - Заменяет русские буквы на английские (для поиска)
+    """
+    cleaned = re.sub(r'\s+', '', plate).upper()
+    # Заменяем русские буквы на английские
+    result = []
+    for ch in cleaned:
+        result.append(RUS_TO_ENG.get(ch, ch))
+    return ''.join(result)
+
+
+def get_display_plate(original_plate: str) -> str:
+    """
+    Форматирует номер для отображения (русскими буквами)
+    """
+    cleaned = re.sub(r'\s+', '', original_plate).upper()
+    result = []
+    for ch in cleaned:
+        # Если буква английская, заменяем на русскую (для красоты)
+        result.append(ENG_TO_RUS.get(ch, ch))
+    return ''.join(result)
+
+
+def get_plate_numbers(plate_field: str) -> list:
+    """
+    Извлекает все номера из строки (разделители , ;)
+    """
+    numbers = re.split(r'[,;]', plate_field)
+    return [normalize_plate(n.strip()) for n in numbers if n.strip()]
 
 
 def is_valid_phone(phone: str) -> bool:
+    """Проверка валидности номера телефона"""
     digits = re.sub(r'\D', '', phone)
     if len(digits) == 11 and (digits.startswith('7') or digits.startswith('8')):
         return True
@@ -75,59 +128,119 @@ def is_valid_phone(phone: str) -> bool:
     return False
 
 
-def find_user_by_phone(phone: str):
+def format_phone_link(phone: str) -> str:
+    """Форматирует телефон для кликабельной ссылки tel:"""
     digits = re.sub(r'\D', '', phone)
     if len(digits) == 11 and digits.startswith('8'):
         digits = '7' + digits[1:]
     elif len(digits) == 10:
         digits = '7' + digits
+    return f"tel:+{digits}"
+
+
+def get_all_users():
+    """Получает всех пользователей из таблицы"""
     try:
         records = sheet.get_all_values()
+        users = []
+        for row in records[1:]:  # Пропускаем заголовок
+            if len(row) >= 3:
+                users.append({
+                    'id': row[0],
+                    'plate': row[1] if len(row) > 1 else '',
+                    'fio': row[2] if len(row) > 2 else '',
+                    'phone': row[3] if len(row) > 3 else '',
+                    'category': row[4] if len(row) > 4 else ''
+                })
+        return users
     except Exception as e:
         logger.error(f"Ошибка чтения таблицы: {e}")
-        return None
-    for row in records[1:]:
-        if len(row) < 4:
-            continue
-        user_phones = re.findall(r'\d+', row[3])
+        return []
+
+
+def find_user_by_phone(phone: str):
+    """Поиск пользователя по номеру телефона"""
+    digits = re.sub(r'\D', '', phone)
+    if len(digits) == 11 and digits.startswith('8'):
+        digits = '7' + digits[1:]
+    elif len(digits) == 10:
+        digits = '7' + digits
+    
+    users = get_all_users()
+    for user in users:
+        user_phones = re.findall(r'\d+', user['phone'])
         for p in user_phones:
             p_clean = re.sub(r'\D', '', p)
             if len(p_clean) == 11 and p_clean.startswith('8'):
                 p_clean = '7' + p_clean[1:]
             if p_clean == digits:
-                return {
-                    'id': row[0], 'plate': row[1], 'fio': row[2],
-                    'phone': row[3], 'category': row[4] if len(row) > 4 else ''
-                }
+                return user
     return None
 
 
-def find_by_plate(plate: str):
-    plate_norm = normalize_plate(plate)
-    try:
-        records = sheet.get_all_values()
-    except Exception as e:
-        logger.error(f"Ошибка чтения таблицы: {e}")
-        return None
-    for row in records[1:]:
-        if len(row) < 3:
+def find_by_plate_partial(query: str):
+    """
+    Поиск автомобилей по части номера.
+    Возвращает ВСЕ совпадения с указанной строкой.
+    """
+    query_norm = normalize_plate(query)
+    users = get_all_users()
+    results = []
+    
+    for user in users:
+        if not user['plate']:
             continue
-        plates = re.split(r'[,;]', row[1])
-        for p in plates:
-            if normalize_plate(p.strip()) == plate_norm:
-                return {
-                    'id': row[0], 'plate': row[1], 'fio': row[2],
-                    'phone': row[3] if len(row) > 3 else '',
-                    'category': row[4] if len(row) > 4 else ''
-                }
-    return None
+        # Получаем все номера автомобиля (может быть несколько через запятую)
+        plate_numbers = get_plate_numbers(user['plate'])
+        for plate_num in plate_numbers:
+            # Проверяем, содержит ли номер искомую строку
+            if query_norm in plate_num:
+                results.append({
+                    'id': user['id'],
+                    'plate_raw': user['plate'],
+                    'plate_normalized': plate_num,
+                    'fio': user['fio'],
+                    'phone': user['phone'],
+                    'category': user['category']
+                })
+                break  # Добавляем пользователя только один раз
+    
+    # Удаляем дубликаты (на случай, если у пользователя несколько номеров и оба подходят)
+    seen = set()
+    unique_results = []
+    for r in results:
+        if r['id'] not in seen:
+            seen.add(r['id'])
+            unique_results.append(r)
+    
+    return unique_results
+
+
+def format_search_result(user: dict) -> str:
+    """
+    Форматирует один результат поиска для отображения
+    """
+    phone = user['phone'] if user['phone'] else 'не указан'
+    phone_link = format_phone_link(phone) if user['phone'] else None
+    
+    masked = mask_fio(user['fio'])
+    display_plate = get_display_plate(user['plate_raw'])
+    
+    response = (
+        f"🚗 <b>Гос. номер:</b> <code>{display_plate}</code>\n"
+        f"👤 <b>Владелец:</b> {masked}\n"
+        f"📞 <b>Телефон:</b> {phone}\n"
+        f"📂 <b>Категория:</b> {user['category']}\n"
+    )
+    return response, phone_link
 
 
 # ======== КОМАНДЫ БОТА ========
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
+    """Обработчик команды /start - регистрация"""
     keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Отправить номер", request_contact=True)]],
+        keyboard=[[KeyboardButton(text="📝 Регистрация")]],
         resize_keyboard=True
     )
     await message.answer(
@@ -140,8 +253,23 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(UserState.waiting_for_phone)
 
 
+@dp.message(F.text == "📝 Регистрация")
+async def registration_button(message: Message, state: FSMContext):
+    """Кнопка регистрации - запрашивает контакт"""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить номер", request_contact=True)]],
+        resize_keyboard=True
+    )
+    await message.answer(
+        "📱 Пожалуйста, отправьте свой номер телефона, нажав на кнопку ниже.\n\n"
+        "Это необходимо для подтверждения вашей регистрации в системе.",
+        reply_markup=keyboard
+    )
+
+
 @dp.message(F.contact)
 async def process_contact(message: Message, state: FSMContext):
+    """Обработка контакта, отправленного кнопкой"""
     phone = message.contact.phone_number
     user = find_user_by_phone(phone)
     if user:
@@ -149,8 +277,10 @@ async def process_contact(message: Message, state: FSMContext):
         await message.answer(
             f"✅ Регистрация успешна!\n\n"
             f"Здравствуйте, <b>{mask_fio(user['fio'])}</b>.\n\n"
-            f"Введите <b>гос. номер автомобиля</b> (например, <code>А123БВ777</code>):",
-            parse_mode="HTML"
+            f"Теперь вы можете искать владельцев по гос. номеру.\n\n"
+            f"🔍 <b>Введите гос. номер автомобиля</b> (можно частично, например, <code>А123</code>):",
+            parse_mode="HTML",
+            reply_markup=types.ReplyKeyboardRemove()
         )
         await state.set_state(UserState.waiting_for_plate)
     else:
@@ -167,6 +297,7 @@ async def process_contact(message: Message, state: FSMContext):
 
 @dp.message(UserState.waiting_for_phone, F.text)
 async def phone_text_fallback(message: Message, state: FSMContext):
+    """Обработка ручного ввода телефона"""
     if is_valid_phone(message.text):
         user = find_user_by_phone(message.text)
         if user:
@@ -174,40 +305,127 @@ async def phone_text_fallback(message: Message, state: FSMContext):
             await message.answer(
                 f"✅ Регистрация успешна!\n\n"
                 f"Здравствуйте, <b>{mask_fio(user['fio'])}</b>.\n\n"
-                f"Введите <b>гос. номер</b>:",
-                parse_mode="HTML"
+                f"🔍 <b>Введите гос. номер</b> (можно частично):",
+                parse_mode="HTML",
+                reply_markup=types.ReplyKeyboardRemove()
             )
             await state.set_state(UserState.waiting_for_plate)
         else:
             await message.answer("❌ Номер не найден в базе.")
     else:
         await message.answer(
-            "⚠️ Отправьте номер кнопкой «📱 Отправить номер» "
+            "⚠️ Пожалуйста, используйте кнопку «📱 Отправить номер» "
             "или введите корректный номер в формате +79XXXXXXXXX"
         )
 
 
+# Хранилище результатов поиска для пагинации
+search_cache = {}
+
+
 @dp.message(UserState.waiting_for_plate)
 async def process_plate(message: Message, state: FSMContext):
+    """Поиск по номеру автомобиля"""
     plate_input = message.text.strip()
-    if not re.match(r'^[А-Яа-я0-9\s]+$', plate_input):
-        await message.answer("⚠️ Номер содержит недопустимые символы. Попробуйте ещё раз:")
+    
+    if not plate_input:
+        await message.answer("⚠️ Пожалуйста, введите номер автомобиля.")
         return
-    result = find_by_plate(plate_input)
-    if result:
-        masked = mask_fio(result['fio'])
-        phones = result['phone'] if result['phone'] else 'не указан'
-        response = (
-            f"🚗 <b>Гос. номер:</b> <code>{plate_input.upper()}</code>\n\n"
-            f"👤 <b>Владелец:</b> {masked}\n"
-            f"📞 <b>Телефон:</b> {phones}\n"
-            f"📂 <b>Категория:</b> {result['category']}\n"
-        )
-        await message.answer(response, parse_mode="HTML")
-    else:
+    
+    # Проверка на допустимые символы (буквы, цифры, пробелы)
+    if not re.match(r'^[А-Яа-яA-Za-z0-9\s]+$', plate_input):
+        await message.answer("⚠️ Номер содержит недопустимые символы. Используйте буквы и цифры.")
+        return
+    
+    results = find_by_plate_partial(plate_input)
+    
+    if not results:
         await message.answer(
-            f"❌ Автомобиль с номером <code>{plate_input.upper()}</code> не найден в базе."
+            f"❌ Автомобили с номером, содержащим <code>{plate_input.upper()}</code>, не найдены в базе.\n\n"
+            f"💡 Попробуйте ввести больше символов или проверьте правильность номера.",
+            parse_mode="HTML"
         )
+        return
+    
+    # Сохраняем результаты в кэш
+    chat_id = message.chat.id
+    search_cache[chat_id] = {
+        'results': results,
+        'page': 0,
+        'total_pages': (len(results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
+    }
+    
+    await send_search_results(message, chat_id, 0)
+
+
+async def send_search_results(message: Message, chat_id: int, page: int):
+    """Отправляет страницу с результатами поиска"""
+    cache = search_cache.get(chat_id)
+    if not cache:
+        await message.answer("❌ Результаты поиска устарели. Пожалуйста, выполните поиск заново.")
+        return
+    
+    results = cache['results']
+    total_pages = cache['total_pages']
+    start_idx = page * RESULTS_PER_PAGE
+    end_idx = min(start_idx + RESULTS_PER_PAGE, len(results))
+    page_results = results[start_idx:end_idx]
+    
+    # Формируем сообщение
+    response_parts = [f"🔍 <b>Найдено автомобилей: {len(results)}</b>\n"]
+    
+    for i, result in enumerate(page_results, start=start_idx + 1):
+        formatted, _ = format_search_result(result)
+        response_parts.append(f"{i}. {formatted}")
+        response_parts.append("─" * 30)
+    
+    response_text = "\n".join(response_parts)
+    
+    # Создаем кнопки пагинации
+    inline_keyboard = []
+    
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"search_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav_buttons.append(InlineKeyboardButton(text="Вперед ▶️", callback_data=f"search_page_{page + 1}"))
+    
+    if nav_buttons:
+        inline_keyboard.append(nav_buttons)
+    
+    # Кнопка "Новый поиск"
+    inline_keyboard.append([InlineKeyboardButton(text="🔄 Новый поиск", callback_data="search_new")])
+    
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=inline_keyboard) if inline_keyboard else None
+    
+    await message.answer(response_text, parse_mode="HTML", reply_markup=reply_markup)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("search_page_"))
+async def handle_search_page(callback: CallbackQuery):
+    """Обработчик пагинации результатов поиска"""
+    page = int(callback.data.split("_")[-1])
+    chat_id = callback.message.chat.id
+    
+    await callback.answer()
+    await send_search_results(callback.message, chat_id, page)
+    await callback.message.delete()  # Удаляем предыдущее сообщение
+
+
+@dp.callback_query(lambda c: c.data == "search_new")
+async def handle_new_search(callback: CallbackQuery, state: FSMContext):
+    """Обработчик кнопки 'Новый поиск'"""
+    chat_id = callback.message.chat.id
+    if chat_id in search_cache:
+        del search_cache[chat_id]
+    
+    await callback.answer()
+    await callback.message.answer(
+        "🔍 Введите номер автомобиля для поиска:",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+    await state.set_state(UserState.waiting_for_plate)
+    await callback.message.delete()
 
 
 # ======== SELF-PING (АНТИ-СОН) ========
