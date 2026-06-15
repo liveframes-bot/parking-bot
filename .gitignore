@@ -5,3 +5,6 @@ __pycache__/
 .env
 venv/
 *.log
+convert.py
+verify.py
+creds_env.txt
