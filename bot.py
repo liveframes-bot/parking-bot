@@ -257,29 +257,39 @@ def format_search_result(user: dict) -> str:
     masked = mask_fio(user['fio'])
     display_plate = get_display_plate(user['plate_raw'])
     
-    # Обработка телефона
+    # Обработка телефонов
+    phone_display = 'не указан'
     if user['phone'] and user['phone'].strip():
-        # Очищаем номер от лишних символов
-        digits = re.sub(r'\D', '', user['phone'])
+        # Разделяем по常见 разделителям
+        raw_phones = re.split(r'[,;\s]+', user['phone'])
+        formatted_phones = []
         
-        # Приводим к международному формату (с кодом 7)
-        if len(digits) == 11 and digits.startswith('8'):
-            digits = '7' + digits[1:]
-        elif len(digits) == 10:
-            digits = '7' + digits
+        for raw_phone in raw_phones:
+            raw_phone = raw_phone.strip()
+            if not raw_phone:
+                continue
+            
+            # Извлекаем цифры
+            digits = ''.join(filter(str.isdigit, raw_phone))
+            if not digits:
+                continue
+            
+            # Нормализуем формат
+            if len(digits) == 11 and digits[0] == '8':
+                digits = '7' + digits[1:]
+            elif len(digits) == 10:
+                digits = '7' + digits
+            
+            # Создаём кликабельную ссылку с плюсом
+            formatted_phones.append(f'<a href="tel:{digits}">+{digits}</a>')
         
-        # Отображаем с плюсом: +79295331517
-        display_phone = '+' + digits
-        
-        # Делаем кликабельным: tel:+79295331517
-        phone_link = f'<a href="tel:{digits}">{display_phone}</a>'
-    else:
-        phone_link = 'не указан'
+        if formatted_phones:
+            phone_display = ', '.join(formatted_phones)
     
     response = (
         f"🚗 <b>Гос. номер:</b> <code>{display_plate}</code>\n"
         f"👤 <b>Владелец:</b> {masked}\n"
-        f"📞 <b>Телефон:</b> {phone_link}\n"
+        f"📞 <b>Телефон:</b> {phone_display}\n"
         f"📂 <b>Категория:</b> {user['category']}\n"
     )
     return response
