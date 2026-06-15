@@ -41,9 +41,8 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
     
     def log_message(self, format, *args):
-        # Отключаем логи health-проверок
-        if '/health' not in args[0] if args else False:
-            super().log_message(format, *args)
+        # Полностью отключаем логи health-сервера
+        pass
 
 
 def run_health_server():
