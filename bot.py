@@ -387,9 +387,43 @@ async def process_plate(message: Message, state: FSMContext):
     """Поиск по номеру автомобиля"""
     plate_input = message.text.strip()
     
+    # Данные пользователя для логирования
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name or str(user_id)
+    
+    logger.info(f"🔍 ПОИСК: Пользователь '{username}' (id:{user_id}) ищет номер '{plate_input}'")
+    
     if not plate_input:
         await message.answer("⚠️ Пожалуйста, введите номер автомобиля.")
         return
+    
+    # Проверка на допустимые символы (буквы, цифры, пробелы)
+    if not re.match(r'^[А-Яа-яA-Za-z0-9\s]+$', plate_input):
+        await message.answer("⚠️ Номер содержит недопустимые символы. Используйте буквы и цифры.")
+        return
+    
+    results = find_by_plate_partial(plate_input)
+    
+    if not results:
+        logger.info(f"❌ ПОИСК: Номер '{plate_input}' НЕ НАЙДЕН (пользователь: {username})")
+        await message.answer(
+            f"❌ Автомобили с номером, содержащим <code>{plate_input.upper()}</code>, не найдены в базе.\n\n"
+            f"💡 Попробуйте ввести больше символов или проверьте правильность номера.",
+            parse_mode="HTML"
+        )
+        return
+    
+    logger.info(f"✅ ПОИСК: Найдено {len(results)} результат(ов) для '{plate_input}' (пользователь: {username})")
+    
+    # Сохраняем результаты в кэш
+    chat_id = message.chat.id
+    search_cache[chat_id] = {
+        'results': results,
+        'page': 0,
+        'total_pages': (len(results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
+    }
+    
+    await send_search_results(message, chat_id, 0)
     
     # Проверка на допустимые символы (буквы, цифры, пробелы)
     if not re.match(r'^[А-Яа-яA-Za-z0-9\s]+$', plate_input):
