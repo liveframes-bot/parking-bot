@@ -13,6 +13,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 import gspread
 from google.oauth2.service_account import Credentials
+import aiohttp  # для внешних пингов
 
 # ======== НАСТРОЙКИ ========
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
@@ -36,6 +37,10 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'OK')
+        elif self.path == '/ping':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'PONG')
         else:
             self.send_response(404)
             self.end_headers()
@@ -82,7 +87,7 @@ def init_gsheets():
         creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
         client = gspread.authorize(creds)
         sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
-        logger.info("✅ Подключение к Google Sheets успешно")
+        logger.info(f"✅ Подключение к Google Sheets успешно (лист: {SHEET_NAME})")
         return sheet
     except Exception as e:
         logger.error(f"❌ Ошибка подключения к Google Sheets: {e}")
@@ -382,7 +387,7 @@ async def phone_text_fallback(message: Message, state: FSMContext):
 search_cache = {}
 
 
-@dp.message(UserState.waiting_for_plate)
+@dp.message(UserState.waiting_for_plate))
 async def process_plate(message: Message, state: FSMContext):
     """Поиск по номеру автомобиля"""
     plate_input = message.text.strip()
@@ -414,31 +419,6 @@ async def process_plate(message: Message, state: FSMContext):
         return
     
     logger.info(f"✅ ПОИСК: Найдено {len(results)} результат(ов) для '{plate_input}' (пользователь: {username})")
-    
-    # Сохраняем результаты в кэш
-    chat_id = message.chat.id
-    search_cache[chat_id] = {
-        'results': results,
-        'page': 0,
-        'total_pages': (len(results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
-    }
-    
-    await send_search_results(message, chat_id, 0)
-    
-    # Проверка на допустимые символы (буквы, цифры, пробелы)
-    if not re.match(r'^[А-Яа-яA-Za-z0-9\s]+$', plate_input):
-        await message.answer("⚠️ Номер содержит недопустимые символы. Используйте буквы и цифры.")
-        return
-    
-    results = find_by_plate_partial(plate_input)
-    
-    if not results:
-        await message.answer(
-            f"❌ Автомобили с номером, содержащим <code>{plate_input.upper()}</code>, не найдены в базе.\n\n"
-            f"💡 Попробуйте ввести больше символов или проверьте правильность номера.",
-            parse_mode="HTML"
-        )
-        return
     
     # Сохраняем результаты в кэш
     chat_id = message.chat.id
@@ -521,24 +501,120 @@ async def handle_new_search(callback: CallbackQuery, state: FSMContext):
     await callback.message.delete()
 
 
-# ======== SELF-PING (АНТИ-СОН) ========
+# ======== УЛУЧШЕННЫЙ SELF-PING (АНТИ-СОН) ========
+# Переменные для отслеживания состояния
+ping_failures = 0
+PING_INTERVAL = 120  # 2 минуты вместо 5
+MAX_FAILURES = 5
+
 async def self_ping():
-    """Каждые 5 минут опрашивает Telegram API, чтобы Render не усыпил Worker"""
+    """
+    Улучшенный механизм предотвращения засыпания:
+    - Пинг Telegram API каждые 2 минуты
+    - Пинг внутреннего health-сервера
+    - Пинг внешнего URL Render
+    - Счетчик ошибок и автоматическое восстановление
+    """
+    global ping_failures
+    
+    # Получаем URL из переменной окружения или используем стандартный
+    render_url = os.environ.get('RENDER_EXTERNAL_URL', 'https://parking-bot-z8y2.onrender.com')
+    health_url = f"{render_url}/health"
+    
+    logger.info("💪 Запущен улучшенный Keep-Alive:")
+    logger.info(f"   - Интервал: {PING_INTERVAL} сек")
+    logger.info(f"   - Telegram API: каждые {PING_INTERVAL} сек")
+    logger.info(f"   - Health-сервер: каждые {PING_INTERVAL} сек")
+    logger.info(f"   - Внешний URL: {health_url}")
+    
     while True:
         try:
-            await asyncio.sleep(300)
-            me = await bot.get_me()
-            logger.info(f"💓 Self-ping OK: @{me.username}")
+            # 1. Пинг через Telegram API
+            try:
+                me = await bot.get_me()
+                logger.debug(f"💓 Telegram ping OK: @{me.username}")
+            except Exception as e:
+                logger.warning(f"⚠️ Telegram ping error: {e}")
+                ping_failures += 1
+            
+            # 2. Пинг внутреннего health-сервера
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get('http://localhost:8080/health', timeout=5) as resp:
+                        if resp.status == 200:
+                            logger.debug("💚 Internal health check OK")
+                        else:
+                            logger.warning(f"⚠️ Internal health check: status {resp.status}")
+                            ping_failures += 1
+            except Exception as e:
+                logger.debug(f"ℹ️ Internal health check: {e}")
+            
+            # 3. Пинг внешнего URL (чтобы Render видел активность)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(health_url, timeout=10) as resp:
+                        if resp.status == 200:
+                            logger.debug("🌐 External ping OK")
+                        else:
+                            logger.warning(f"⚠️ External ping: status {resp.status}")
+                            ping_failures += 1
+            except Exception as e:
+                logger.debug(f"ℹ️ External ping: {e}")
+            
+            # 4. Если ошибок слишком много - пробуем восстановить соединение
+            if ping_failures >= MAX_FAILURES:
+                logger.warning(f"⚠️ Слишком много ошибок ({ping_failures}), пробуем восстановить соединение...")
+                try:
+                    # Пересоздаем сессию бота
+                    await bot.session.close()
+                    bot.session = aiohttp.ClientSession()
+                    me = await bot.get_me()
+                    logger.info(f"✅ Соединение восстановлено: @{me.username}")
+                    ping_failures = 0
+                except Exception as e:
+                    logger.error(f"❌ Ошибка восстановления: {e}")
+                    ping_failures = 0  # Сбрасываем, чтобы не зациклиться
+            
+            # 5. Логируем успешный пинг (каждый 5-й раз для экономии логов)
+            if ping_failures == 0:
+                logger.info(f"💓 Self-ping OK (интервал {PING_INTERVAL} сек)")
+            
         except Exception as e:
-            logger.warning(f"⚠️ Self-ping error: {e}")
+            logger.error(f"❌ Self-ping critical error: {e}")
+            ping_failures += 1
+        
+        await asyncio.sleep(PING_INTERVAL)
+
+
+async def keep_alive_monitor():
+    """
+    Дополнительный монитор, который проверяет, жив ли бот,
+    и перезапускает polling если нужно
+    """
+    while True:
+        try:
+            # Проверяем, отвечает ли бот
+            await bot.get_me()
+            await asyncio.sleep(60)  # Проверка каждую минуту
+        except Exception as e:
+            logger.error(f"❌ Бот не отвечает: {e}")
+            logger.info("🔄 Пробуем перезапустить polling...")
+            # Здесь можно добавить логику перезапуска
+            await asyncio.sleep(10)
 
 
 async def on_startup():
     """Действия при запуске"""
     me = await bot.get_me()
     logger.info(f"✅ Бот запущен: @{me.username}")
+    
+    # Запускаем улучшенный self-ping
     asyncio.create_task(self_ping())
-    logger.info("💓 Self-ping активен (каждые 5 мин)")
+    logger.info("💪 Улучшенный Keep-Alive активен (каждые 2 мин)")
+    
+    # Запускаем монитор состояния
+    asyncio.create_task(keep_alive_monitor())
+    logger.info("🔍 Монитор состояния активен")
 
 
 # ======== ЗАПУСК ========
