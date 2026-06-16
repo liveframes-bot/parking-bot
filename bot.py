@@ -387,7 +387,7 @@ async def phone_text_fallback(message: Message, state: FSMContext):
 search_cache = {}
 
 
-@dp.message(UserState.waiting_for_plate))
+@dp.message(UserState.waiting_for_plate)
 async def process_plate(message: Message, state: FSMContext):
     """Поиск по номеру автомобиля"""
     plate_input = message.text.strip()
