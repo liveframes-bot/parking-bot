@@ -1,10 +1,25 @@
+# Локальные служебные скрипты
+yesterday
+test_*.py
+debug_*.py
+convert.py
+verify.py
+
+# Секреты и локальные файлы
+.env
+*.log
+search_log.txt
 credentials.json
 creds_env.txt
 __pycache__/
 *.pyc
-.env
-venv/
-*.log
-convert.py
-verify.py
-creds_env.txt
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
