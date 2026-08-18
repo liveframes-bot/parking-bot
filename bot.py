@@ -4,6 +4,7 @@ import json
 import asyncio
 import logging
 import datetime
+import html as html_mod
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from aiogram import Bot, Dispatcher, types, F
@@ -70,6 +71,12 @@ bot = Bot(token=TELEGRAM_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+
+async def sheets_call(func, *args, **kwargs):
+    """Выполняет синхронный вызов gspread в отдельном потоке,
+    чтобы не блокировать event loop бота."""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
 # ======== КОНСТАНТЫ ========
 RESULTS_PER_PAGE = 5
 
@@ -132,6 +139,7 @@ sheet, reg_sheet, search_sheet = init_gsheets()
 # Кэш зарегистрированных: telegram_id -> row_number в Лист1
 REGISTERED_TG_TO_ROW = {}
 ROW_TO_REGISTERED_TG = {}
+REGISTERED_TG_IDS = set()  # telegram_id, уже зарегистрированные в боте
 
 # Кэш дедупликации поиска: (tg_id, query_normalized) -> datetime
 SEARCH_DEDUP_CACHE = {}
@@ -140,10 +148,13 @@ DEDUP_WINDOW_SECONDS = 300  # 5 минут
 
 def rebuild_registered_cache():
     """Перестраивает кэш зарегистрированных пользователей"""
-    global REGISTERED_TG_TO_ROW, ROW_TO_REGISTERED_TG
+    global REGISTERED_TG_TO_ROW, ROW_TO_REGISTERED_TG, REGISTERED_TG_IDS
     try:
         reg_rows = reg_sheet.get_all_values()
         registered_data = []
+        REGISTERED_TG_IDS = {
+            row[1].strip() for row in reg_rows[1:] if len(row) >= 2 and row[1].strip()
+        }
         for row in reg_rows[1:]:
             if len(row) >= 5 and row[1]:
                 registered_data.append({
@@ -329,10 +340,10 @@ def format_search_result(user: dict) -> str:
             phone_display = ', '.join(formatted_phones)
     
     response = (
-        f"🚗 <b>Гос. номер:</b> <code>{display_plate}</code>\n"
-        f"👤 <b>Владелец:</b> {masked}\n"
+        f"🚗 <b>Гос. номер:</b> <code>{html_mod.escape(display_plate)}</code>\n"
+        f"👤 <b>Владелец:</b> {html_mod.escape(masked)}\n"
         f"📞 <b>Телефон:</b> {phone_display}\n"
-        f"📂 <b>Категория:</b> {user['category']}\n"
+        f"📂 <b>Категория:</b> {html_mod.escape(user['category'] or '')}\n"
     )
     return response
 
@@ -471,31 +482,37 @@ async def registration_button(message: Message, state: FSMContext):
 @dp.message(F.contact)
 async def process_contact(message: Message, state: FSMContext):
     phone = message.contact.phone_number
-    user = find_user_by_phone(phone)
+    user = await sheets_call(find_user_by_phone, phone)
     if user:
         await state.update_data(phone=phone, user_id=user['id'], fio=user['fio'])
         
         tg_name = message.from_user.first_name or ''
         tg_username = message.from_user.username or ''
         
-        # Записываем регистрацию
-        log_registration_to_sheet(
-            user_id=message.from_user.id,
-            username=tg_username,
-            tg_name=tg_name,
-            user_data=user
-        )
+        already_registered = str(message.from_user.id) in REGISTERED_TG_IDS
         
-        # Обновляем кэш
-        rebuild_registered_cache()
-        
-        # Уведомляем админов
-        await notify_admins_new_registration(
-            user_id=message.from_user.id,
-            username=tg_username,
-            tg_name=tg_name,
-            user_data=user
-        )
+        if not already_registered:
+            # Записываем регистрацию
+            await sheets_call(
+                log_registration_to_sheet,
+                user_id=message.from_user.id,
+                username=tg_username,
+                tg_name=tg_name,
+                user_data=user
+            )
+            
+            # Обновляем кэш
+            await sheets_call(rebuild_registered_cache)
+            
+            # Уведомляем админов
+            await notify_admins_new_registration(
+                user_id=message.from_user.id,
+                username=tg_username,
+                tg_name=tg_name,
+                user_data=user
+            )
+        else:
+            logger.info(f"⏭️ Повторная регистрация без записи: {message.from_user.id}")
         
         await message.answer(
             f"✅ Регистрация успешна!\n\n"
@@ -521,31 +538,30 @@ async def process_contact(message: Message, state: FSMContext):
 @dp.message(UserState.waiting_for_phone, F.text)
 async def phone_text_fallback(message: Message, state: FSMContext):
     if is_valid_phone(message.text):
-        user = find_user_by_phone(message.text)
+        user = await sheets_call(find_user_by_phone, message.text)
         if user:
             await state.update_data(phone=message.text, user_id=user['id'], fio=user['fio'])
             
             tg_name = message.from_user.first_name or ''
             tg_username = message.from_user.username or ''
             
-            # Записываем регистрацию
-            log_registration_to_sheet(
-                user_id=message.from_user.id,
-                username=tg_username,
-                tg_name=tg_name,
-                user_data=user
-            )
+            already_registered = str(message.from_user.id) in REGISTERED_TG_IDS
             
-            # Обновляем кэш
-            rebuild_registered_cache()
-            
-            # Уведомляем админов
-            await notify_admins_new_registration(
-                user_id=message.from_user.id,
-                username=tg_username,
-                tg_name=tg_name,
-                user_data=user
-            )
+            if not already_registered:
+                await sheets_call(
+                    log_registration_to_sheet,
+                    user_id=message.from_user.id,
+                    username=tg_username,
+                    tg_name=tg_name,
+                    user_data=user
+                )
+                await sheets_call(rebuild_registered_cache)
+                await notify_admins_new_registration(
+                    user_id=message.from_user.id,
+                    username=tg_username,
+                    tg_name=tg_name,
+                    user_data=user
+                )
             
             await message.answer(
                 f"✅ Регистрация успешна!\n\n"
@@ -565,9 +581,10 @@ async def phone_text_fallback(message: Message, state: FSMContext):
 
 
 search_cache = {}
+SEARCH_CACHE_LIMIT = 100
 
 
-@dp.message(UserState.waiting_for_plate)
+@dp.message(UserState.waiting_for_plate, F.text)
 async def process_plate(message: Message, state: FSMContext):
     plate_input = message.text.strip()
     
@@ -585,11 +602,11 @@ async def process_plate(message: Message, state: FSMContext):
         await message.answer("⚠️ Номер содержит недопустимые символы. Используйте буквы и цифры.")
         return
     
-    results = find_by_plate_partial(plate_input)
+    results = await sheets_call(find_by_plate_partial, plate_input)
     
     # Записываем в Google Sheets (с защитой от дублей)
     owner_ids = [r['id'] for r in results]
-    log_search_to_sheet(user_id, username, tg_name, plate_input, len(results), owner_ids)
+    await sheets_call(log_search_to_sheet, user_id, username, tg_name, plate_input, len(results), owner_ids)
     
     if not results:
         await message.answer(
@@ -599,25 +616,14 @@ async def process_plate(message: Message, state: FSMContext):
         )
         return
     
-    # Подсвечиваем только зарегистрированных владельцев
-    rows_to_highlight = set()
-    for r in results:
-        try:
-            cell = sheet.find(r['id'])
-            if cell and cell.row in ROW_TO_REGISTERED_TG:
-                rows_to_highlight.add(cell.row)
-        except Exception:
-            pass
-    
-    if rows_to_highlight:
-        highlight_registered_owners(rows_to_highlight)
-    
     chat_id = message.chat.id
     search_cache[chat_id] = {
         'results': results,
         'page': 0,
         'total_pages': (len(results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
     }
+    while len(search_cache) > SEARCH_CACHE_LIMIT:
+        search_cache.pop(next(iter(search_cache)))
     
     await send_search_results(message, chat_id, 0)
 
@@ -698,7 +704,7 @@ async def cmd_registrations(message: Message):
         return
     
     try:
-        rows = reg_sheet.get_all_values()
+        rows = await sheets_call(reg_sheet.get_all_values)
         if len(rows) <= 1:
             await message.answer("📭 Пока никто не зарегистрировался.")
             return
@@ -735,7 +741,7 @@ async def cmd_searches(message: Message):
         return
     
     try:
-        rows = search_sheet.get_all_values()
+        rows = await sheets_call(search_sheet.get_all_values)
         if len(rows) <= 1:
             await message.answer("📭 Поисков ещё не было.")
             return
@@ -769,11 +775,25 @@ async def cmd_refresh_cache(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("⛔ Только для админов.")
         return
-    rebuild_registered_cache()
+    await sheets_call(rebuild_registered_cache)
     await message.answer(
         f"✅ Кэш обновлён.\n"
         f"Зарегистрировано в боте: {len(REGISTERED_TG_TO_ROW)} совпадений с жильцами."
     )
+
+
+@dp.message(Command("highlight"))
+async def cmd_highlight(message: Message):
+    """Подсвечивает зарегистрированных владельцев жёлтым (по запросу, не при каждом поиске)"""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для админов.")
+        return
+    await message.answer("🎨 Подсвечиваю зарегистрированных владельцев...")
+    try:
+        await sheets_call(highlight_registered_owners, set(ROW_TO_REGISTERED_TG.keys()))
+        await message.answer(f"✅ Подсвечено строк: {len(ROW_TO_REGISTERED_TG)}.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
 
 
 @dp.message(Command("clear_highlight"))
@@ -817,25 +837,27 @@ async def cmd_cleanup_searches(message: Message):
     await message.answer(f"🧹 Очищаю записи старше {days} дней...")
     
     try:
-        rows = search_sheet.get_all_values()
+        rows = await sheets_call(search_sheet.get_all_values)
         if len(rows) <= 1:
             await message.answer("📭 Лист пуст.")
             return
-        
+
         rows_to_delete = []
         for idx in range(len(rows) - 1, 0, -1):
             row = rows[idx]
             if len(row) >= 1 and row[0] < cutoff_str:
                 rows_to_delete.append(idx + 1)
-        
+
         if not rows_to_delete:
             await message.answer("✅ Нечего удалять — все записи свежие.")
             return
-        
-        deleted = 0
-        for row_num in rows_to_delete:
-            search_sheet.delete_rows(row_num)
-            deleted += 1
+
+        def do_delete():
+            for row_num in rows_to_delete:
+                search_sheet.delete_rows(row_num)
+
+        await sheets_call(do_delete)
+        deleted = len(rows_to_delete)
         
         await message.answer(f"✅ Удалено {deleted} записей старше {days} дней.")
         logger.info(f"🧹 Админ очистил {deleted} записей поиска")
@@ -853,7 +875,7 @@ async def cmd_cleanup_registrations(message: Message):
     await message.answer("🧹 Удаляю дубли регистраций...")
     
     try:
-        rows = reg_sheet.get_all_values()
+        rows = await sheets_call(reg_sheet.get_all_values)
         if len(rows) <= 1:
             await message.answer("📭 Лист пуст.")
             return
@@ -879,14 +901,17 @@ async def cmd_cleanup_registrations(message: Message):
             await message.answer("✅ Дублей нет.")
             return
         
-        for row_num in sorted(rows_to_delete, reverse=True):
-            reg_sheet.delete_rows(row_num)
-        
+        def do_delete():
+            for row_num in sorted(rows_to_delete, reverse=True):
+                reg_sheet.delete_rows(row_num)
+
+        await sheets_call(do_delete)
+
         await message.answer(f"✅ Удалено {len(rows_to_delete)} дублей регистраций.")
         logger.info(f"🧹 Удалено {len(rows_to_delete)} дублей в 'Регистрации'")
-        
+
         # Обновляем кэш
-        rebuild_registered_cache()
+        await sheets_call(rebuild_registered_cache)
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
@@ -899,9 +924,12 @@ MAX_FAILURES = 5
 
 async def self_ping():
     global ping_failures
-    render_url = os.environ.get('RENDER_EXTERNAL_URL', 'https://parking-bot-z8y2.onrender.com')
+    render_url = os.environ.get('RENDER_EXTERNAL_URL')
+    if not render_url:
+        logger.info("💤 Self-ping отключён (не PaaS, RENDER_EXTERNAL_URL не задан)")
+        return
     health_url = f"{render_url}/health"
-    
+
     logger.info("💪 Keep-Alive активен:")
     logger.info(f"   - Интервал: {PING_INTERVAL} сек")
     logger.info(f"   - URL: {health_url}")

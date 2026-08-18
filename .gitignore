@@ -7,6 +7,8 @@ verify.py
 
 # Секреты и локальные файлы
 .env
+parking-bot.env
+deploy/env/
 *.log
 search_log.txt
 credentials.json
